@@ -1,10 +1,17 @@
+import hashlib
+import json
 import os
+import queue
+import re
+import secrets
+import shutil
 import sqlite3
 import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timedelta
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 # ---------- Base de datos (kiosco.db queda al lado del programa) ----------
@@ -24,6 +31,12 @@ CREATE TABLE IF NOT EXISTS cierres(
   id INTEGER PRIMARY KEY AUTOINCREMENT, fecha TEXT, desde TEXT, inicial REAL,
   efectivo REAL, retiros REAL, esperado REAL, contado REAL, diferencia REAL, ganancia REAL);
 CREATE TABLE IF NOT EXISTS config(clave TEXT PRIMARY KEY, valor TEXT);
+CREATE TABLE IF NOT EXISTS cola_ingresos(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, fecha TEXT, codigo TEXT, cantidad REAL, nota TEXT, subida INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS cola_borrados(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT, subida INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_items_codigo ON items(codigo);
+CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha);
 """)
 
 
@@ -37,11 +50,20 @@ addcol("productos", "stock", "REAL DEFAULT 0")
 addcol("productos", "stock_min", "REAL DEFAULT 0")
 addcol("items", "costo", "REAL DEFAULT 0")
 addcol("ventas", "anulada", "INTEGER DEFAULT 0")
+addcol("productos", "creado", "TEXT")
+addcol("productos", "sucio", "INTEGER DEFAULT 0")
+addcol("ventas", "subida", "INTEGER DEFAULT 0")
+addcol("ventas", "anul_subida", "INTEGER DEFAULT 0")
+addcol("productos", "promo_n", "INTEGER DEFAULT 2")
+addcol("productos", "en_hoja", "INTEGER DEFAULT 0")
+con.execute("UPDATE productos SET creado=? WHERE creado IS NULL", (datetime.now().strftime("%Y-%m-%d"),))
 con.commit()
 
 # ---------- Configuración guardada en la base ----------
 DEFAULTS = {"nombre": "MI KIOSCO", "t_nombre": "", "t_l2": "", "t_l3": "", "t_num": "Ticket Nro",
-            "t_total": "TOTAL", "t_pie": "Gracias por su compra!", "t_pie2": "", "ancho": "40", "auto_ticket": "0"}
+            "t_total": "TOTAL", "t_pie": "Gracias por su compra!", "t_pie2": "", "ancho": "40", "auto_ticket": "0",
+            "tema": "claro", "dias_sin_venta": "21", "pin_admin": "", "pin_empleado": "", "pin_rec": "",
+            "sheets_on": "0", "sheets_id": "", "caja_id": "C1", "sheets_seg": "60", "sheets_preparada": "0"}
 _cfg = dict(con.execute("SELECT clave,valor FROM config"))
 
 
@@ -66,8 +88,32 @@ def nombre():
     return cfg("nombre").strip() or "MI KIOSCO"
 
 
+def hpin(p):
+    return hashlib.sha256(("kiosco|" + p).encode("utf-8")).hexdigest()
+
+
+def rol_de(pin):
+    h = hpin(pin)
+    if cfg("pin_admin") and h == cfg("pin_admin"):
+        return "admin"
+    if cfg("pin_empleado") and h == cfg("pin_empleado"):
+        return "empleado"
+    return None
+
+
 PROMOS = {"ninguna": "Sin promo", "2da50": "Segunda unidad al 50%", "2x1": "2x1",
-          "3x2": "3x2", "pct": "Descuento %"}
+          "3x2": "3x2", "pct": "Descuento %", "nesima": "Unidad N con % de descuento",
+          "pack": "Desde N unidades, % de descuento"}
+AYUDA_PROMO = {
+    "ninguna": "Sin promoción.",
+    "2da50": "La segunda unidad sale al 50%.",
+    "2x1": "Llevando 2 pagás 1.",
+    "3x2": "Llevando 3 pagás 2.",
+    "pct": "Descuento fijo: completá el % de descuento.",
+    "nesima": "Completá N y el %. La unidad N lleva ese descuento. Ej: N=2 y 30% = la segunda con 30% OFF; "
+              "N=3 y 100% = la tercera gratis.",
+    "pack": "Completá N y el %. Desde N unidades, TODAS llevan ese descuento. Ej: N=3 y 15%.",
+}
 REV = {v: k for k, v in PROMOS.items()}
 METODOS = ["Efectivo", "Transferencia", "Débito", "Crédito"]
 
@@ -86,7 +132,14 @@ def fmt(n):
     return "$" + txt.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def descuento(precio, cant, promo, valor):
+def ordinal(n):
+    return {2: "2da", 3: "3ra", 4: "4ta", 5: "5ta", 6: "6ta"}.get(n, f"{n}ª")
+
+
+def descuento(precio, cant, promo, valor, n=2):
+    """Plata que se descuenta por la promo del producto (valor = % de descuento, n = unidad / cantidad)."""
+    n = max(2, int(n or 2))
+    valor = max(0, min(100, valor or 0))
     if promo == "2da50":
         return (cant // 2) * precio * 0.5
     if promo == "2x1":
@@ -95,12 +148,464 @@ def descuento(precio, cant, promo, valor):
         return (cant // 3) * precio
     if promo == "pct":
         return cant * precio * valor / 100
+    if promo == "nesima":              # cada N unidades, la N-ésima lleva el % de descuento
+        return (cant // n) * precio * valor / 100
+    if promo == "pack":                # desde N unidades, todas llevan el % de descuento
+        return cant * precio * valor / 100 if cant >= n else 0
     return 0
+
+
+def etiqueta_promo(promo, valor, n=2):
+    n = max(2, int(n or 2))
+    return {"2da50": "2da al 50% OFF", "2x1": "2x1", "3x2": "3x2", "pct": f"{valor:g}% OFF",
+            "nesima": f"{ordinal(n)} al {valor:g}% OFF",
+            "pack": f"Desde {n}u: {valor:g}% OFF"}.get(promo, "")
+
+
+def info_promo(promo, valor, n, cant):
+    """(texto para la columna Promo, estado). estado: '' sin promo | 'pend' (se puede ofrecer más) | 'ok' (aplicada)"""
+    if not promo or promo == "ninguna":
+        return "", ""
+    n = max(2, int(n or 2))
+    minimo = {"2da50": 2, "2x1": 2, "3x2": 3, "pct": 1, "nesima": n, "pack": n}.get(promo, 1)
+    et = etiqueta_promo(promo, valor, n)
+    return (f"✓ {et}", "ok") if cant >= minimo else (f"OFERTA: {et}", "pend")
 
 
 def bajos():
     return con.execute("SELECT codigo,nombre,stock,stock_min FROM productos "
                        "WHERE stock_min>0 AND stock<=stock_min ORDER BY nombre").fetchall()
+
+
+def sin_movimiento():
+    """Productos que no se venden hace X días (o que se cargaron hace X días y nunca se vendieron)."""
+    try:
+        dias = int(cfg("dias_sin_venta"))
+    except ValueError:
+        dias = 21
+    if dias <= 0:
+        return []
+    hoy = datetime.now().date()
+    out = []
+    for cod, nom, stock, creado, ult in con.execute(
+            "SELECT p.codigo,p.nombre,p.stock,p.creado,"
+            "(SELECT MAX(substr(v.fecha,1,10)) FROM items i JOIN ventas v ON v.id=i.venta_id "
+            " WHERE i.codigo=p.codigo AND v.anulada=0) FROM productos p"):
+        ref = ult or creado
+        try:
+            d = (hoy - datetime.strptime(ref, "%Y-%m-%d").date()).days
+        except (TypeError, ValueError):
+            continue
+        if d >= dias:
+            out.append((cod, nom, stock, d, ult))
+    return sorted(out, key=lambda x: -x[3])
+
+
+# ---------- Sincronización con Google Sheets ----------
+# Cómo funciona el stock: en la planilla, la columna H de cada producto es una FÓRMULA:
+#     stock = suma de la hoja "Ingresos"  -  suma de la hoja "Movimientos" (ventas)
+# Cada caja solo AGREGA filas (nunca pisa números), así varias cajas pueden vender a la vez sin perder nada.
+RUTA_JSON = os.path.join(BASE, "credenciales.json")
+H_PROD = ["Código", "Nombre", "Precio", "Costo", "Promo", "% Promo", "Stock mínimo", "Stock actual (no tocar)",
+          "N (para promos)"]
+H_ING = ["Fecha", "Código", "Cantidad", "Nota", "Caja"]
+H_MOV = ["ID", "Fecha", "Código", "Cantidad", "Producto", "Precio", "Descuento", "Subtotal", "Medio de pago",
+         "Caja", "Venta N°", "Tipo"]
+_SEP = [","]   # separador de argumentos que acepta tu planilla ("," o ";"): se detecta solo
+
+
+def f_stock(n):
+    s = _SEP[0]
+    return f"=SUMIF(Ingresos!B:B{s}A{n}{s}Ingresos!C:C)-SUMIF(Movimientos!C:C{s}A{n}{s}Movimientos!D:D)"
+
+
+def norm_cod(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def a_num(v, defecto=0.0):
+    if isinstance(v, (int, float)):
+        return float(v)
+    return num(v) if str(v).strip() else defecto
+
+
+def clave_promo(t):
+    t = str(t).strip().lower()
+    for k, v in PROMOS.items():
+        if t in (k.lower(), v.lower()):
+            return k
+    return "ninguna"
+
+
+def extraer_id(txt):
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", txt or "")
+    return m.group(1) if m else (txt or "").strip()
+
+
+def abrir_db():
+    d = sqlite3.connect(os.path.join(BASE, "kiosco.db"), timeout=20)
+    d.execute("PRAGMA busy_timeout=20000")
+    return d
+
+
+def mail_del_json():
+    try:
+        with open(RUTA_JSON, encoding="utf-8") as f:
+            return json.load(f).get("client_email")
+    except (OSError, ValueError):
+        return None
+
+
+def registrar_ingreso(codigo, cantidad, nota):
+    """Anota una entrada/salida de stock para subirla a la planilla (hoja Ingresos)."""
+    if cantidad:
+        con.execute("INSERT INTO cola_ingresos(fecha,codigo,cantidad,nota) VALUES(?,?,?,?)",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), codigo, cantidad, nota))
+        con.commit()
+
+
+def explicar_error(e):
+    t, n = str(e), type(e).__name__
+    if isinstance(e, FileNotFoundError):
+        return "No encuentro el archivo credenciales.json. Elegilo con el botón de abajo."
+    if "No module named" in t:
+        return "Falta la librería gspread. Generá el .exe de nuevo con el crear_exe.bat actualizado."
+    if n == "SpreadsheetNotFound" or "404" in t:
+        return ("No encuentro la planilla. Revisá el link y que esté compartida como Editor con el mail "
+                "de la cuenta de servicio.")
+    if "SERVICE_DISABLED" in t or "has not been used" in t or "is disabled" in t:
+        return "Falta habilitar Google Sheets API en tu proyecto de Google Cloud."
+    if "PERMISSION_DENIED" in t or "403" in t:
+        return "Google no deja entrar: compartí la planilla con el mail de la cuenta de servicio como Editor."
+    if "invalid_grant" in t or "Invalid JWT" in t:
+        return "El archivo de claves no sirve, o la fecha/hora de esta PC está mal."
+    if "RESOURCE_EXHAUSTED" in t or "429" in t:
+        return "Google pidió ir más despacio. Se reintenta solo."
+    if any(x in n for x in ("Connection", "Timeout")) or "Max retries" in t or "getaddrinfo" in t:
+        return "Sin conexión a internet. Se sube todo cuando vuelva."
+    return "Error: " + t[:200]
+
+
+class HojaGoogle:
+    """Habla con la planilla real usando una cuenta de servicio (librería gspread)."""
+
+    def __init__(self, archivo, sheet_id):
+        import gspread
+        if not os.path.exists(archivo):
+            raise FileNotFoundError(archivo)
+        self.sh = gspread.service_account(filename=archivo).open_by_key(sheet_id)
+
+    def titulo(self):
+        return self.sh.title
+
+    @staticmethod
+    def _r(hoja, rango):
+        return f"'{hoja}'!{rango}"
+
+    def _leer(self, hoja, rango):
+        d = self.sh.values_get(self._r(hoja, rango), params={"valueRenderOption": "UNFORMATTED_VALUE"})
+        return d.get("values", [])
+
+    def leer_productos(self):
+        return self._leer("Productos", "A1:I")
+
+    def escribir_productos(self, updates, nuevos):
+        """Escribe A:G (datos) e I (N de la promo). La columna H (stock) es fórmula y no se toca.
+        Devuelve los números de fila de los productos nuevos."""
+        data, nuevas = [], []
+        filas = list(updates)
+        if nuevos:
+            col = self._leer("Productos", "A1:A")
+            ultima = max([i + 1 for i, f in enumerate(col) if f and norm_cod(f[0])] or [1])
+            for k, v in enumerate(nuevos):
+                filas.append((ultima + 1 + k, v))
+                nuevas.append(ultima + 1 + k)
+        for n, v in filas:
+            data.append({"range": self._r("Productos", f"A{n}:G{n}"), "values": [v[:7]]})
+            data.append({"range": self._r("Productos", f"I{n}"), "values": [[v[7]]]})
+        if data:
+            self.sh.values_batch_update({"valueInputOption": "RAW", "data": data})
+        return nuevas
+
+    def escribir_formulas(self, filas):
+        """Pone la fórmula de stock en las filas indicadas. Detecta solo si tu planilla usa , o ; """
+        if not filas:
+            return
+        for _ in range(2):
+            data = [{"range": self._r("Productos", f"H{n}"), "values": [[f_stock(n)]]} for n in filas]
+            self.sh.values_batch_update({"valueInputOption": "USER_ENTERED", "data": data})
+            m = self._leer("Productos", f"H{filas[0]}:H{filas[0]}")
+            v = m[0][0] if m and m[0] else ""
+            if not (isinstance(v, str) and v.startswith("#")):
+                return
+            _SEP[0] = ";" if _SEP[0] == "," else ","
+        raise RuntimeError("Google rechazó la fórmula de stock. Probá el botón Reparar planilla.")
+
+    def limpiar_stock(self):
+        self.sh.values_clear(self._r("Productos", "H2:H"))
+
+    def borrar_productos(self, codigos):
+        if not codigos:
+            return
+        col = self._leer("Productos", "A1:A")
+        filas = sorted({i + 1 for i, f in enumerate(col) if i > 0 and f and norm_cod(f[0]) in codigos}, reverse=True)
+        if filas:
+            sid = self.sh.worksheet("Productos").id
+            self.sh.batch_update({"requests": [{"deleteDimension": {"range": {
+                "sheetId": sid, "dimension": "ROWS", "startIndex": n - 1, "endIndex": n}}} for n in filas]})
+
+    def _agregar(self, hoja, filas):
+        if filas:
+            self.sh.values_append(self._r(hoja, "A1"),
+                                  params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+                                  body={"values": filas})
+
+    def agregar_ingresos(self, filas):
+        self._agregar("Ingresos", filas)
+
+    def agregar_movimientos(self, filas):
+        self._agregar("Movimientos", filas)
+
+    def preparar(self):
+        """Crea las hojas Productos / Ingresos / Movimientos (si faltan), con títulos y formato."""
+        ex = {w.title: w for w in self.sh.worksheets()}
+        if "Productos" not in ex and len(ex) == 1:
+            w0 = list(ex.values())[0]
+            if not any(any(c for c in fila) for fila in w0.get_all_values()):
+                w0.update_title("Productos")      # planilla nueva y vacía: reutiliza la primera hoja
+                ex = {"Productos": w0}
+        for nombre, cab, filas in (("Productos", H_PROD, 2000), ("Ingresos", H_ING, 2000), ("Movimientos", H_MOV, 5000)):
+            if nombre not in ex:
+                ex[nombre] = self.sh.add_worksheet(title=nombre, rows=filas, cols=max(len(cab), 9))
+            self.sh.values_update(self._r(nombre, "A1"), params={"valueInputOption": "RAW"}, body={"values": [cab]})
+        try:   # formato lindo (si falla, no pasa nada)
+            reqs = []
+            for nombre, col in (("Productos", 0), ("Ingresos", 1), ("Movimientos", 2)):
+                sid = ex[nombre].id
+                reqs.append({"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 1, "startColumnIndex": col,
+                                                      "endColumnIndex": col + 1},
+                                            "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+                                            "fields": "userEnteredFormat.numberFormat"}})
+                reqs.append({"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
+                                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                                     "backgroundColor": {"red": 0.88, "green": 0.91, "blue": 0.99}}},
+                                            "fields": "userEnteredFormat(textFormat,backgroundColor)"}})
+                reqs.append({"updateSheetProperties": {"properties": {"sheetId": sid,
+                             "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
+            reqs.append({"setDataValidation": {
+                "range": {"sheetId": ex["Productos"].id, "startRowIndex": 1, "endRowIndex": 5000,
+                          "startColumnIndex": 4, "endColumnIndex": 5},
+                "rule": {"condition": {"type": "ONE_OF_LIST",
+                                       "values": [{"userEnteredValue": v} for v in PROMOS.values()]},
+                         "showCustomUi": True, "strict": False}}})
+            self.sh.batch_update({"requests": reqs})
+        except Exception:
+            pass
+
+
+def codigos_con_fila(filas):
+    return [i + 1 for i, f in enumerate(filas) if i > 0 and f and norm_cod(f[0])]
+
+
+def sincronizar(db, hoja, caja):
+    """Una pasada completa. Si algo falla (sin internet, etc.) levanta la excepción y NADA se marca como subido."""
+    r = {"ventas": 0, "ingresos": 0, "subidos": 0, "bajados": 0, "ignoradas": 0, "borrados": 0,
+         "borrados_hoja": 0, "bloqueado": 0}
+
+    # 1) ventas (y anulaciones) -> hoja Movimientos
+    mov, marcas = [], []
+    pend = db.execute("SELECT id,fecha,metodo,anulada,subida,anul_subida FROM ventas "
+                      "WHERE subida=0 OR (subida=1 AND anulada=1 AND anul_subida=0)").fetchall()
+    for vid, fecha, metodo, anulada, subida, anul_sub in pend:
+        if subida == 0 and anulada == 1:       # se anuló antes de subirse: no hace falta subir nada
+            marcas.append(("UPDATE ventas SET subida=2 WHERE id=?", vid))
+            continue
+        items = db.execute("SELECT id,codigo,nombre,cantidad,precio,descuento,subtotal FROM items WHERE venta_id=?",
+                           (vid,)).fetchall()
+        if subida == 0:
+            for iid, cod, nom, cant, pre, desc, sub in items:
+                mov.append([f"{caja}-{vid}-{iid}", fecha, cod, cant, nom, pre, desc, sub, metodo, caja, vid, "VENTA"])
+            marcas.append(("UPDATE ventas SET subida=1 WHERE id=?", vid))
+            r["ventas"] += 1
+        else:                                  # venta ya subida y luego anulada: filas en negativo
+            for iid, cod, nom, cant, pre, desc, sub in items:
+                mov.append([f"{caja}-{vid}-{iid}-A", fecha, cod, -cant, nom, pre, -desc, -sub, metodo, caja, vid,
+                            "ANULACION"])
+            marcas.append(("UPDATE ventas SET anul_subida=1 WHERE id=?", vid))
+    if mov:
+        hoja.agregar_movimientos(mov)
+    for sql, vid in marcas:
+        db.execute(sql, (vid,))
+    db.commit()
+
+    # 2) ingresos de stock hechos en el programa -> hoja Ingresos
+    ing = db.execute("SELECT id,fecha,codigo,cantidad,nota FROM cola_ingresos WHERE subida=0 ORDER BY id").fetchall()
+    if ing:
+        hoja.agregar_ingresos([[f, c, q, n, caja] for _, f, c, q, n in ing])
+        db.executemany("UPDATE cola_ingresos SET subida=1 WHERE id=?", [(i[0],) for i in ing])
+        db.commit()
+        r["ingresos"] = len(ing)
+
+    # 3a) productos borrados en el programa -> se borra la fila de la planilla
+    bor = db.execute("SELECT id,codigo FROM cola_borrados WHERE subida=0").fetchall()
+    if bor:
+        hoja.borrar_productos({c for _, c in bor})
+        db.executemany("UPDATE cola_borrados SET subida=1 WHERE id=?", [(i,) for i, _ in bor])
+        db.commit()
+        r["borrados_hoja"] = len(bor)
+
+    # 3b) productos creados/editados en el programa -> hoja Productos
+    sucios = db.execute("SELECT codigo,nombre,precio,costo,promo,valor,stock_min,promo_n FROM productos "
+                        "WHERE sucio=1").fetchall()
+    if sucios:
+        filas = hoja.leer_productos()
+        pos = {norm_cod(f[0]): i + 1 for i, f in enumerate(filas) if i > 0 and f and norm_cod(f[0])}
+        upd, nuevos = [], []
+        for cod, nom, pre, co, pr, val, sm, pn in sucios:
+            vals = [cod, nom, pre, co, PROMOS.get(pr, PROMOS["ninguna"]), val, sm, pn]
+            if cod in pos:
+                upd.append((pos[cod], vals))
+            else:
+                nuevos.append(vals)
+        nuevas = hoja.escribir_productos(upd, nuevos)
+        hoja.escribir_formulas(nuevas)
+        db.executemany("UPDATE productos SET sucio=0, en_hoja=1 WHERE codigo=?", [(s[0],) for s in sucios])
+        db.commit()
+        r["subidos"] = len(sucios)
+
+    # 4) catálogo y stock de la planilla -> programa
+    filas = hoja.leer_productos()
+    faltan = [i + 1 for i, f in enumerate(filas) if i > 0 and f and norm_cod(f[0]) and
+              (len(f) < 8 or f[7] in ("", None) or (isinstance(f[7], str) and f[7].startswith("#")))]
+    if faltan:                                  # filas nuevas escritas a mano en la planilla: les pone la fórmula
+        hoja.escribir_formulas(faltan)
+        filas = hoja.leer_productos()
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    db.execute("BEGIN IMMEDIATE")      # mientras se actualiza, una venta nueva espera unos milisegundos
+    try:
+        pv = dict(db.execute("SELECT i.codigo,SUM(i.cantidad) FROM items i JOIN ventas v ON v.id=i.venta_id "
+                             "WHERE v.anulada=0 AND v.subida=0 GROUP BY i.codigo"))
+        pa = dict(db.execute("SELECT i.codigo,SUM(i.cantidad) FROM items i JOIN ventas v ON v.id=i.venta_id "
+                             "WHERE v.anulada=1 AND v.subida=1 AND v.anul_subida=0 GROUP BY i.codigo"))
+        pi = dict(db.execute("SELECT codigo,SUM(cantidad) FROM cola_ingresos WHERE subida=0 GROUP BY codigo"))
+        locales = {x[0] for x in db.execute("SELECT codigo FROM productos WHERE sucio=1")}
+        borrando = {x[0] for x in db.execute("SELECT codigo FROM cola_borrados WHERE subida=0")}
+        en_sheet = set()
+        for i, f in enumerate(filas):
+            if i == 0 or not f:
+                continue
+            f = list(f) + [""] * (9 - len(f))
+            cod, nom, pre = norm_cod(f[0]), str(f[1]).strip(), a_num(f[2])
+            if not cod:
+                continue
+            en_sheet.add(cod)
+            if not nom or pre <= 0:
+                r["ignoradas"] += 1
+                continue
+            if cod in locales or cod in borrando:
+                continue
+            costo, promo, val, smin = a_num(f[3]), clave_promo(f[4]), a_num(f[5]), a_num(f[6])
+            pn = max(2, int(a_num(f[8], 2) or 2))
+            stock = None if f[7] in ("", None) or (isinstance(f[7], str) and f[7].startswith("#")) else a_num(f[7])
+            viejo = db.execute("SELECT nombre,precio,costo,promo,valor,stock_min,promo_n FROM productos "
+                               "WHERE codigo=?", (cod,)).fetchone()
+            nuevo = (nom, pre, costo, promo, val, smin, pn)
+            if viejo is None:
+                db.execute("INSERT INTO productos(codigo,nombre,precio,costo,promo,valor,stock_min,promo_n,stock,"
+                           "creado,en_hoja) VALUES(?,?,?,?,?,?,?,?,0,?,1)", (cod,) + nuevo + (hoy,))
+                r["bajados"] += 1
+            elif tuple(viejo) != nuevo:
+                db.execute("UPDATE productos SET nombre=?,precio=?,costo=?,promo=?,valor=?,stock_min=?,promo_n=?,"
+                           "en_hoja=1 WHERE codigo=?", nuevo + (cod,))
+                r["bajados"] += 1
+            else:
+                db.execute("UPDATE productos SET en_hoja=1 WHERE codigo=? AND en_hoja=0", (cod,))
+            if stock is not None:
+                db.execute("UPDATE productos SET stock=? WHERE codigo=?",
+                           (stock - pv.get(cod, 0) + pa.get(cod, 0) + pi.get(cod, 0), cod))
+        # productos que ya estaban en la planilla y ahora no están: se borraron allá -> se borran acá
+        if en_sheet:
+            cand = [x[0] for x in db.execute("SELECT codigo FROM productos WHERE en_hoja=1 AND sucio=0")
+                    if x[0] not in en_sheet and x[0] not in borrando]
+            total = db.execute("SELECT COUNT(*) FROM productos WHERE en_hoja=1").fetchone()[0]
+            if len(cand) >= 6 and len(cand) * 2 >= total:
+                r["bloqueado"] = len(cand)     # desaparecieron muchísimos de golpe: seguro fue un error
+            else:
+                db.executemany("DELETE FROM productos WHERE codigo=?", [(c,) for c in cand])
+                r["borrados"] = len(cand)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return r
+
+
+def resumen_sync(r):
+    partes = []
+    if r["ventas"]:
+        partes.append(f"{r['ventas']} venta(s) subida(s)")
+    if r["ingresos"]:
+        partes.append(f"{r['ingresos']} ingreso(s) de stock subido(s)")
+    if r["subidos"]:
+        partes.append(f"{r['subidos']} producto(s) enviados")
+    if r["bajados"]:
+        partes.append(f"{r['bajados']} producto(s) actualizados desde la planilla")
+    if r["borrados"]:
+        partes.append(f"{r['borrados']} producto(s) borrados (los quitaste de la planilla)")
+    if r["borrados_hoja"]:
+        partes.append(f"{r['borrados_hoja']} producto(s) quitados de la planilla")
+    if r["bloqueado"]:
+        partes.append(f"ATENCIÓN: faltan {r['bloqueado']} productos en la planilla; por seguridad NO se borraron "
+                      "del programa. Revisá que no hayas borrado filas sin querer")
+    if r["ignoradas"]:
+        partes.append(f"{r['ignoradas']} fila(s) ignoradas (falta nombre o precio)")
+    return ", ".join(partes) or "Todo al día"
+
+
+def reparar_planilla(hoja):
+    """Vuelve a poner títulos, formato y la fórmula de stock en cada producto (arregla planillas viejas o rotas)."""
+    hoja.preparar()
+    hoja.limpiar_stock()
+    filas = hoja.leer_productos()
+    rows = codigos_con_fila(filas)
+    hoja.escribir_formulas(rows)
+    return f"Planilla reparada: fórmula de stock puesta en {len(rows)} producto(s) (separador '{_SEP[0]}')."
+
+
+def preparar_planilla(db, hoja, caja):
+    """Primera vez: crea las hojas y sube el catálogo y el stock actual. Si la planilla ya tiene productos
+    (otra caja ya la preparó), solo se une a ella."""
+    hoja.preparar()
+    hoja.limpiar_stock()
+    filas = hoja.leer_productos()
+    hay = any(norm_cod(f[0]) for f in filas[1:] if f)
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not hay:
+        prods = db.execute("SELECT codigo,nombre,precio,costo,promo,valor,stock_min,promo_n,stock FROM productos "
+                           "ORDER BY nombre").fetchall()
+        nuevas = hoja.escribir_productos([], [[c, n, p, co, PROMOS.get(pr, PROMOS["ninguna"]), v, sm, pn]
+                                              for c, n, p, co, pr, v, sm, pn, st in prods])
+        hoja.escribir_formulas(nuevas)
+        hoja.agregar_ingresos([[ahora, c, st, "Stock inicial", caja] for c, n, p, co, pr, v, sm, pn, st in prods if st])
+        db.execute("UPDATE productos SET sucio=0, en_hoja=1")
+        msg = f"Planilla lista: {len(prods)} producto(s) enviados con su stock actual."
+    else:
+        db.execute("UPDATE productos SET sucio=0")
+        hoja.escribir_formulas(codigos_con_fila(filas))
+        en_hoja = {norm_cod(f[0]) for f in filas[1:] if f}
+        for (cod,) in db.execute("SELECT codigo FROM productos").fetchall():
+            db.execute("UPDATE productos SET sucio=?, en_hoja=? WHERE codigo=?",
+                       (0, 1, cod) if cod in en_hoja else (1, 0, cod))
+        msg = "Te uniste a una planilla que ya tenía productos. El stock se toma de la planilla."
+    # lo vendido/ingresado hasta hoy ya está reflejado en el stock que se subió: no se vuelve a subir
+    db.execute("UPDATE ventas SET subida=CASE WHEN anulada=1 THEN 2 ELSE 1 END WHERE subida=0")
+    db.execute("UPDATE cola_ingresos SET subida=1 WHERE subida=0")
+    db.commit()
+    return msg
 
 
 # ---------- Tickets e impresión ----------
@@ -160,15 +665,29 @@ def imprimir(texto, nombre_archivo):
 
 # ---------- Tema visual ----------
 FONT = "Segoe UI"
-BG, CARD, HEAD = "#EEF1F6", "#FFFFFF", "#1E293B"
-PRIMARY, PRIMARY_H = "#2563EB", "#1D4ED8"
-OK, OK_H = "#16A34A", "#15803D"
-DANGER, DANGER_L, DANGER_LH = "#DC2626", "#FEE2E2", "#FECACA"
-TEXT, MUTED, LINE = "#1F2937", "#6B7280", "#E5E9F0"
-SOMBRA, SOMBRA2 = "#CDD4DF", "#E1E6EE"
-GRIS, GRIS_H = "#EEF1F6", "#E2E7EF"
-SUAVE, SUAVE_H, SUAVE_T = "#E0E7FF", "#C7D2FE", "#3730A3"
-AMBAR, AMBAR_H = "#D97706", "#B45309"
+PALETAS = {
+    "claro": dict(BG="#EEF1F6", CARD="#FFFFFF", HEAD="#1E293B", PRIMARY="#2563EB", PRIMARY_H="#1D4ED8",
+                  OK="#16A34A", OK_H="#15803D", DANGER="#DC2626", DANGER_L="#FEE2E2", DANGER_LH="#FECACA",
+                  ROJO_T="#B91C1C", TEXT="#1F2937", MUTED="#6B7280", LINE="#E5E9F0", SOMBRA="#CDD4DF",
+                  SOMBRA2="#E1E6EE", GRIS="#EEF1F6", GRIS_H="#E2E7EF", SUAVE="#E0E7FF", SUAVE_H="#C7D2FE",
+                  SUAVE_T="#3730A3", AMBAR="#D97706", AMBAR_H="#B45309", INPUT="#F3F5F9", INPUT_B="#DDE3EC",
+                  STRIPE="#F8FAFC", HEADBG="#F3F5F9", SELBG="#DBEAFE", VERDE_BG="#DCFCE7", VERDE_T="#15803D",
+                  ROJO_BG="#FEE2E2", NEUTRO="#F3F5F9", AMB_BG="#FEF3C7", AMB_T="#92400E"),
+    "oscuro": dict(BG="#0F172A", CARD="#1E293B", HEAD="#020617", PRIMARY="#3B82F6", PRIMARY_H="#2563EB",
+                   OK="#16A34A", OK_H="#15803D", DANGER="#EF4444", DANGER_L="#4C1D1D", DANGER_LH="#6B2525",
+                   ROJO_T="#FCA5A5", TEXT="#F1F5F9", MUTED="#94A3B8", LINE="#334155", SOMBRA="#0A0F1C",
+                   SOMBRA2="#0C1322", GRIS="#334155", GRIS_H="#475569", SUAVE="#312E81", SUAVE_H="#3F3A9E",
+                   SUAVE_T="#C7D2FE", AMBAR="#D97706", AMBAR_H="#B45309", INPUT="#0F172A", INPUT_B="#334155",
+                   STRIPE="#223048", HEADBG="#273449", SELBG="#1E3A8A", VERDE_BG="#14532D", VERDE_T="#86EFAC",
+                   ROJO_BG="#4C1D1D", NEUTRO="#273449", AMB_BG="#4A3B12", AMB_T="#FCD34D"),
+}
+
+
+def set_paleta(modo):
+    globals().update(PALETAS[modo if modo in PALETAS else "claro"])
+
+
+set_paleta(cfg("tema"))
 
 
 def aplicar_tema(root):
@@ -177,17 +696,24 @@ def aplicar_tema(root):
     st.configure(".", background=BG, foreground=TEXT, font=(FONT, 11))
     st.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT, rowheight=38,
                  font=(FONT, 12), borderwidth=0, relief="flat", bordercolor=CARD, lightcolor=CARD, darkcolor=CARD)
-    st.configure("Treeview.Heading", background="#F3F5F9", foreground=MUTED, font=(FONT, 10, "bold"),
+    st.configure("Treeview.Heading", background=HEADBG, foreground=MUTED, font=(FONT, 10, "bold"),
                  relief="flat", padding=(8, 8))
-    st.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", TEXT)])
-    st.map("Treeview.Heading", background=[("active", "#E8ECF3")])
+    st.map("Treeview", background=[("selected", SELBG)], foreground=[("selected", TEXT)])
+    st.map("Treeview.Heading", background=[("active", GRIS_H)])
     st.configure("TButton", background=PRIMARY, foreground="white", font=(FONT, 11, "bold"),
                  padding=(14, 8), borderwidth=0, focusthickness=0, focuscolor=PRIMARY)
     st.map("TButton", background=[("active", PRIMARY_H), ("pressed", PRIMARY_H)])
     st.configure("Peligro.TButton", background=DANGER)
     st.map("Peligro.TButton", background=[("active", "#B91C1C"), ("pressed", "#B91C1C")])
-    st.configure("TEntry", fieldbackground="#F3F5F9", padding=6)
-    st.configure("TCombobox", padding=6)
+    st.configure("TEntry", fieldbackground=INPUT, foreground=TEXT, padding=6)
+    st.configure("TCombobox", padding=6, fieldbackground=INPUT, foreground=TEXT, background=GRIS, arrowcolor=TEXT)
+    st.map("TCombobox", fieldbackground=[("readonly", INPUT)], foreground=[("readonly", TEXT)],
+           selectbackground=[("readonly", INPUT)], selectforeground=[("readonly", TEXT)])
+    st.configure("Vertical.TScrollbar", background=GRIS_H, troughcolor=CARD, bordercolor=CARD, arrowcolor=TEXT,
+                 lightcolor=GRIS_H, darkcolor=GRIS_H)
+    root.option_add("*TCombobox*Listbox.background", INPUT)
+    root.option_add("*TCombobox*Listbox.foreground", TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", PRIMARY)
     st.configure("TLabelframe", background=BG, bordercolor=LINE)
     st.configure("TLabelframe.Label", background=BG, foreground=MUTED, font=(FONT, 10, "bold"))
 
@@ -202,8 +728,9 @@ def rrect(c, x1, y1, x2, y2, r, **kw):
 class Boton(tk.Canvas):
     """Botón redondeado con sombra, efecto al pasar el mouse y al apretar."""
 
-    def __init__(self, master, text, command, color=PRIMARY, hover=PRIMARY_H, fg="white",
-                 h=44, size=12, r=12, bgc=CARD, sombra=True, w=10):
+    def __init__(self, master, text, command, color=None, hover=None, fg="white",
+                 h=44, size=12, r=12, bgc=None, sombra=True, w=10):
+        color, hover, bgc = color or PRIMARY, hover or PRIMARY_H, bgc or CARD
         super().__init__(master, width=w, height=h, bg=bgc, highlightthickness=0, cursor="hand2")
         self.text, self.command, self.color, self.hcolor = text, command, color, hover
         self.fg, self.size, self.r, self.sombra, self.estado = fg, size, r, sombra, "n"
@@ -283,7 +810,7 @@ def lista(parent, columnas, height=None):
     for k, tx, w, anc, st in columnas:
         t.heading(k, text=tx, anchor=anc)
         t.column(k, width=w, anchor=anc, stretch=st)
-    t.tag_configure("par", background="#F8FAFC")
+    t.tag_configure("par", background=STRIPE)
     sb.pack(side="right", fill="y")
     t.pack(side="left", fill="both", expand=True)
     return f, t
@@ -292,9 +819,9 @@ def lista(parent, columnas, height=None):
 class Pestana(tk.Canvas):
     """Pestaña estilo navegador (todas en la misma ventana)."""
 
-    def __init__(self, master, text, command, bgc=HEAD):
+    def __init__(self, master, text, command, bgc=None):
         self.fnt = tkfont.Font(family=FONT, size=11, weight="bold")
-        super().__init__(master, width=self.fnt.measure(text) + 40, height=44, bg=bgc, highlightthickness=0, cursor="hand2")
+        super().__init__(master, width=self.fnt.measure(text) + 28, height=44, bg=bgc or HEAD, highlightthickness=0, cursor="hand2")
         self.text, self.command, self.sel, self.hov, self.alerta = text, command, False, False, False
         self.bind("<Button-1>", lambda e: self.command())
         self.bind("<Enter>", lambda e: self.hover(True))
@@ -311,7 +838,7 @@ class Pestana(tk.Canvas):
 
     def texto(self, t, alerta=False):
         self.text, self.alerta = t, alerta
-        self.config(width=self.fnt.measure(t) + 40)
+        self.config(width=self.fnt.measure(t) + 28)
         self.draw()
 
     def draw(self):
@@ -331,8 +858,8 @@ class Pestana(tk.Canvas):
 class Tarjeta(tk.Canvas):
     """Panel blanco con esquinas redondeadas y sombra. Los widgets van en .inner"""
 
-    def __init__(self, master, bgc=BG, auto=True, r=16, pad=14, **kw):
-        super().__init__(master, bg=bgc, highlightthickness=0, **kw)
+    def __init__(self, master, bgc=None, auto=True, r=16, pad=14, **kw):
+        super().__init__(master, bg=bgc or BG, highlightthickness=0, **kw)
         self.r, self.pad, self.auto, self.face = r, pad, auto, CARD
         self.inner = tk.Frame(self, bg=CARD)
         self.win = self.create_window(pad, pad, window=self.inner, anchor="nw")
@@ -360,21 +887,104 @@ class Tarjeta(tk.Canvas):
 
 
 def entrada(master, size=20, **kw):
-    return tk.Entry(master, font=(FONT, size), bg="#F3F5F9", fg=TEXT, relief="flat", insertbackground=PRIMARY,
-                    highlightthickness=2, highlightbackground="#DDE3EC", highlightcolor=PRIMARY, **kw)
+    return tk.Entry(master, font=(FONT, size), bg=INPUT, fg=TEXT, relief="flat", insertbackground=PRIMARY,
+                    highlightthickness=2, highlightbackground=INPUT_B, highlightcolor=PRIMARY, **kw)
 
 
+
+
+# ---------- Pantalla de PIN ----------
+class Login(tk.Frame):
+    """Tapa toda la ventana hasta que se ingresa un PIN válido (administrador o empleado)."""
+
+    def __init__(self, app):
+        super().__init__(app, bg=BG)
+        self.app = app
+        self.place(x=0, y=0, relwidth=1, relheight=1)
+        self.lift()
+        card = Tarjeta(self, width=390, pad=24)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        i = card.inner
+        tk.Label(i, text=nombre(), bg=CARD, fg=TEXT, font=(FONT, 22, "bold")).pack()
+        self.msg = tk.Label(i, text="Ingresá tu PIN", bg=CARD, fg=MUTED, font=(FONT, 12))
+        self.msg.pack(pady=(2, 10))
+
+        self.f_pin = tk.Frame(i, bg=CARD)
+        self.f_pin.pack(fill="x")
+        self.pin = entrada(self.f_pin, 26, show="•", justify="center")
+        self.pin.pack(fill="x", ipady=8)
+        self.pin.bind("<Return>", lambda e: self.entrar())
+        pad = tk.Frame(self.f_pin, bg=CARD)
+        pad.pack(fill="x", pady=(10, 0))
+        pad.columnconfigure((0, 1, 2), weight=1, uniform="k")
+        for n, t in enumerate(("1", "2", "3", "4", "5", "6", "7", "8", "9", "Borrar", "0", "Entrar")):
+            if t == "Entrar":
+                b = Boton(pad, t, self.entrar, color=OK, hover=OK_H, h=50, size=12)
+            elif t == "Borrar":
+                b = Boton(pad, t, lambda: self.pin.delete(len(self.pin.get()) - 1), color=GRIS, hover=GRIS_H,
+                          fg=TEXT, h=50, size=11)
+            else:
+                b = Boton(pad, t, lambda t=t: self.pin.insert("end", t), color=GRIS, hover=GRIS_H, fg=TEXT,
+                          h=50, size=16)
+            b.grid(row=n // 3, column=n % 3, sticky="ew", padx=3, pady=3)
+        self.olv = tk.Label(i, text="Olvidé mi PIN", bg=CARD, fg=PRIMARY, font=(FONT, 10, "underline"), cursor="hand2")
+        self.olv.pack(pady=(10, 0))
+        self.olv.bind("<Button-1>", lambda e: self.ver_recuperar(True))
+
+        self.f_rec = tk.Frame(i, bg=CARD)
+        self.rec = entrada(self.f_rec, 20, justify="center")
+        self.rec.pack(fill="x", ipady=8)
+        self.rec.bind("<Return>", lambda e: self.recuperar())
+        Boton(self.f_rec, "Recuperar acceso", self.recuperar, h=46, size=12).pack(fill="x", pady=(10, 0))
+        Boton(self.f_rec, "Volver", lambda: self.ver_recuperar(False), color=GRIS, hover=GRIS_H, fg=TEXT,
+              h=40, size=10).pack(fill="x", pady=(8, 0))
+        self.pin.focus_set()
+
+    def ver_recuperar(self, si):
+        if si:
+            self.f_pin.pack_forget()
+            self.olv.pack_forget()
+            self.f_rec.pack(fill="x")
+            self.msg.config(text="Escribí tu código de recuperación", fg=MUTED)
+            self.rec.focus_set()
+        else:
+            self.f_rec.pack_forget()
+            self.f_pin.pack(fill="x")
+            self.olv.pack(pady=(10, 0))
+            self.msg.config(text="Ingresá tu PIN", fg=MUTED)
+            self.pin.focus_set()
+
+    def entrar(self):
+        rol = rol_de(self.pin.get().strip())
+        if rol:
+            self.destroy()
+            self.app.iniciar_sesion(rol)
+        else:
+            self.pin.delete(0, "end")
+            self.msg.config(text="PIN incorrecto, probá de nuevo", fg=DANGER)
+
+    def recuperar(self):
+        code = self.rec.get().strip().upper()
+        if cfg("pin_rec") and hpin(code) == cfg("pin_rec"):
+            for k in ("pin_admin", "pin_empleado", "pin_rec"):
+                set_cfg(k, "")
+            self.destroy()
+            self.app.iniciar_sesion("admin")
+            self.app.toast("Se borraron los PIN. Creá nuevos en Configuración", AMBAR, 6000)
+        else:
+            self.rec.delete(0, "end")
+            self.msg.config(text="Código incorrecto", fg=DANGER)
 
 
 # ---------- Ventana principal: pestañas + caja ----------
 class App(tk.Tk):
+    # None = todas las pestañas. El empleado no ve precios de compra, ganancias ni configuración.
+    PERMISOS = {"admin": None, "empleado": ("Caja", "Stock", "Ventas", "Cierre")}
+
     def __init__(self):
         super().__init__()
-        self.title(nombre() + " - Caja")
-        self.geometry("1240x760")
-        self.minsize(1100, 680)
-        self.configure(bg=BG)
-        aplicar_tema(self)
+        self.geometry("1280x740")
+        self.minsize(1280, 660)
         self.cart = {}  # codigo -> [nombre, precio, cant, promo, valor, costo]
         self.total = 0.0
         self.ticket = tk.BooleanVar(value=cfg("auto_ticket") == "1")
@@ -384,13 +994,32 @@ class App(tk.Tk):
         self.t_fin = None
         self._toast = None
         self.actual = "Caja"
-        self.paginas, self.tabs = {}, {}
+        self.rol = None
+        self.sync = {"corriendo": False, "ultimo": "", "error": ""}
+        self.sync_log, self.sync_avisar, self._t_pronto = [], True, None
+        self.q_sync = queue.Queue()
+        self.construir()
+        if cfg("pin_admin"):
+            self.bloquear()
+        else:
+            self.iniciar_sesion("admin")
+        self.after(4000, self._ciclo_sync)
 
+    def construir(self):
+        """Arma toda la ventana (se vuelve a llamar al cambiar entre modo claro y oscuro)."""
+        self.configure(bg=BG)
+        aplicar_tema(self)
+        self.paginas, self.tabs = {}, {}
+        self._toast = None
         head = tk.Frame(self, bg=HEAD, height=62)
         head.pack(fill="x")
         head.pack_propagate(False)
         self.lbl_nombre = tk.Label(head, text=nombre(), bg=HEAD, fg="white", font=(FONT, 18, "bold"))
         self.lbl_nombre.pack(side="left", padx=(22, 10))
+        Boton(head, "Bloquear", self.bloquear, color="#334155", hover="#475569", h=40, size=10, bgc=HEAD,
+              sombra=False, w=92).pack(side="right", padx=(4, 16), pady=11)
+        Boton(head, "Claro" if cfg("tema") == "oscuro" else "Oscuro", self.cambiar_tema, color="#334155",
+              hover="#475569", h=40, size=10, bgc=HEAD, sombra=False, w=78).pack(side="right", padx=4, pady=11)
         self.barra = tk.Frame(head, bg=HEAD)
         self.barra.pack(side="left", fill="y", padx=(14, 0))
         self.cont = tk.Frame(self, bg=BG)
@@ -405,29 +1034,171 @@ class App(tk.Tk):
         self.agregar("Stock", Stock(self.cont, self), "<F3>")
         self.agregar("Ventas", Ventas(self.cont, self), "<F4>")
         self.agregar("Reportes", Reportes(self.cont, self), "<F5>")
-        self.agregar("Cierre de caja", Cierre(self.cont, self), "<F6>")
+        self.agregar("Cierre", Cierre(self.cont, self), "<F6>")
         self.agregar("Configuración", Configuracion(self.cont, self), "<F7>")
+        self.agregar("Sheets", Sheets(self.cont, self), "<F8>")
 
-        self.bind("<F12>", lambda e: self.actual == "Caja" and self.cobrar())
-        self.bind("<Escape>", lambda e: self.actual == "Caja" and self.cancelar())
-        self.bind("<FocusIn>", lambda e: self.scan.focus_set() if (e.widget is self and self.actual == "Caja") else None)
+        self.bind("<F12>", lambda e: self.rol and self.actual == "Caja" and self.cobrar())
+        self.bind("<Escape>", lambda e: self.rol and self.actual == "Caja" and self.cancelar())
+        self.bind("<FocusIn>", lambda e: self.scan.focus_set()
+                  if (e.widget is self and self.actual == "Caja" and self.rol) else None)
         self.elegir("Efectivo")
         self.refresh()
-        self.ir("Caja")
+        self.aplicar_rol()
+
+    # ----- usuarios y PIN -----
+    def permitidas(self):
+        p = self.PERMISOS.get(self.rol, ())
+        return list(self.paginas) if p is None else [n for n in self.paginas if n in p]
+
+    def aplicar_rol(self):
+        ok = self.permitidas()
+        for t in self.tabs.values():
+            t.pack_forget()
+        for n in self.paginas:
+            if n in ok:
+                self.tabs[n].pack(side="left", padx=2, pady=(18, 0))
+        r = {"admin": "Administrador", "empleado": "Empleado"}.get(self.rol, "")
+        self.title(nombre() + " - Caja" + (f"  ({r})" if r and cfg("pin_admin") else ""))
         self.upd_stock_btn()
-        self.after(600, self.aviso_stock)
+
+    def bloquear(self):
+        if not cfg("pin_admin"):
+            self.toast("Primero creá un PIN en Configuración > Seguridad", AMBAR, 4500)
+            return
+        if self.cobrando:
+            self._fin_cobro()
+        self.rol = None
+        Login(self)
+
+    def iniciar_sesion(self, rol):
+        self.rol = rol
+        self.aplicar_rol()
+        self.ir("Caja")
+        self.after(500, self.avisos_inicio)
+
+    def avisos_inicio(self):
+        partes = []
+        n = len(bajos())
+        if n:
+            partes.append(f"⚠ {n} producto(s) con poco stock")
+        if self.rol == "admin":
+            m = len(sin_movimiento())
+            if m:
+                partes.append(f"{m} sin ventas hace {cfg('dias_sin_venta')}+ días (ver Reportes)")
+        if partes:
+            self.toast("      ".join(partes), AMBAR, 6500)
+
+    # ----- modo oscuro -----
+    def cambiar_tema(self):
+        nuevo = "claro" if cfg("tema") == "oscuro" else "oscuro"
+        set_cfg("tema", nuevo)
+        set_paleta(nuevo)
+        self.after(10, self.reconstruir)
+
+    def reconstruir(self):
+        if self.cobrando:
+            self._fin_cobro()
+        actual = self.actual
+        for w in self.winfo_children():
+            w.destroy()
+        self.construir()
+        self.ir(actual if actual in self.permitidas() else "Caja")
+
+    # ----- sincronización con Google Sheets (en segundo plano, sin trabar la caja) -----
+    def sheets_activo(self):
+        return (cfg("sheets_on") == "1" and cfg("sheets_preparada") == "1" and bool(cfg("sheets_id"))
+                and os.path.exists(RUTA_JSON))
+
+    def pedir_sync(self, seg=6):
+        """Después de una venta o un cambio: sincroniza en unos segundos (junta varios cambios en una sola vez)."""
+        if not self.sheets_activo():
+            return
+        if self._t_pronto:
+            self.after_cancel(self._t_pronto)
+        self._t_pronto = self.after(seg * 1000, self.lanzar_sync)
+
+    def _ciclo_sync(self):
+        self.lanzar_sync()
+        try:
+            seg = max(15, int(cfg("sheets_seg")))
+        except ValueError:
+            seg = 60
+        self.after(seg * 1000, self._ciclo_sync)
+
+    def lanzar_sync(self, modo="sync", manual=False):
+        if self.sync["corriendo"]:
+            if manual:
+                self.toast("Ya se está sincronizando...", HEAD)
+            return
+        if modo == "sync" and not self.sheets_activo():
+            return
+        self.sync["corriendo"] = True
+        caja, sid = cfg("caja_id") or "C1", extraer_id(cfg("sheets_id"))
+
+        def trabajo():
+            db = None
+            try:
+                hoja = HojaGoogle(RUTA_JSON, sid)
+                if modo == "probar":
+                    msg = f"Conectado a «{hoja.titulo()}»"
+                elif modo == "reparar":
+                    msg = reparar_planilla(hoja)
+                else:
+                    db = abrir_db()
+                    msg = preparar_planilla(db, hoja, caja) if modo == "preparar" else resumen_sync(sincronizar(db, hoja, caja))
+                self.q_sync.put(("ok", msg, modo, manual))
+            except Exception as e:
+                self.q_sync.put(("error", explicar_error(e), modo, manual))
+            finally:
+                if db:
+                    db.close()
+        threading.Thread(target=trabajo, daemon=True).start()
+        self.after(400, self._poll_sync)
+
+    def _poll_sync(self):
+        try:
+            tipo, msg, modo, manual = self.q_sync.get_nowait()
+        except queue.Empty:
+            self.after(400, self._poll_sync)
+            return
+        hora = datetime.now().strftime("%H:%M:%S")
+        self.sync["corriendo"] = False
+        if tipo == "ok":
+            if modo == "preparar":
+                set_cfg("sheets_preparada", "1")
+                set_cfg("sheets_on", "1")
+            if modo in ("sync", "preparar"):
+                self.sync["ultimo"] = hora
+            self.sync["error"] = ""
+            if msg != "Todo al día" or manual:
+                self.sync_log.append(f"{hora}  {msg}")
+        else:
+            self.sync["error"] = msg
+            self.sync_log.append(f"{hora}  ERROR: {msg}")
+        for n in ("Productos", "Stock"):
+            if n in self.paginas:
+                self.paginas[n].load()
+        self.upd_stock_btn()
+        if "Sheets" in self.paginas:
+            self.paginas["Sheets"].al_mostrar()
+        if manual or (tipo == "error" and self.sync_avisar):
+            self.toast(("✓ " if tipo == "ok" else "") + msg, OK if tipo == "ok" else DANGER, 5000)
+        self.sync_avisar = tipo != "error"      # avisa el primer error, no cada vez que reintenta
 
     # ----- pestañas -----
     def agregar(self, nombre_tab, pagina, tecla):
         pagina.grid(row=0, column=0, sticky="nsew")
         self.paginas[nombre_tab] = pagina
         t = Pestana(self.barra, nombre_tab, lambda n=nombre_tab: self.ir(n))
-        t.pack(side="left", padx=2, pady=(18, 0))
         self.tabs[nombre_tab] = t
         self.bind(tecla, lambda e, n=nombre_tab: self.ir(n))
 
     def ir(self, n):
-        if n not in self.paginas:
+        if n not in self.paginas or self.rol is None:
+            return
+        if n not in self.permitidas():
+            self.toast("Esa sección es solo para el administrador", AMBAR)
             return
         if self.cobrando:
             self._fin_cobro()
@@ -475,6 +1246,9 @@ class App(tk.Tk):
         self.scan.pack(fill="x", pady=(6, 2), ipady=8)
         tk.Label(c.inner, text="Varias unidades: 3*código     |     Supr o Borrar = sacar 1 unidad", bg=CARD,
                  fg=MUTED, font=(FONT, 9)).pack(anchor="w")
+        self.lbl_promo = tk.Label(c.inner, text=" ", bg=CARD, fg=MUTED, font=(FONT, 12, "bold"), anchor="w",
+                                  justify="left", padx=10, pady=5)
+        self.lbl_promo.pack(fill="x", pady=(8, 0))
         self.scan.bind("<Return>", self.on_scan)
         self.scan.bind("<Delete>", self.borrar_item)
         self.scan.bind("<BackSpace>", self.borrar_item)
@@ -488,13 +1262,15 @@ class App(tk.Tk):
             row=0, column=0, sticky="ew", padx=(0, 5))
         Boton(bar, "Sacar producto completo", self.quitar, color=GRIS, hover=GRIS_H, fg=TEXT, h=44,
               size=10).grid(row=0, column=1, sticky="ew", padx=5)
-        Boton(bar, "Cancelar venta  (Esc)", self.cancelar, color=DANGER_L, hover=DANGER_LH, fg="#B91C1C", h=44,
+        Boton(bar, "Cancelar venta  (Esc)", self.cancelar, color=DANGER_L, hover=DANGER_LH, fg=ROJO_T, h=44,
               size=10).grid(row=0, column=2, sticky="ew", padx=(5, 0))
-        fr, self.tree = lista(cart.inner, (("nombre", "Producto", 250, "w", True), ("cant", "Cant", 55, "e", False),
-                                           ("precio", "Precio", 95, "e", False), ("desc", "Descuento", 105, "e", False),
-                                           ("sub", "Subtotal", 110, "e", False)))
+        fr, self.tree = lista(cart.inner, (("nombre", "Producto", 180, "w", True), ("promo", "Promo", 235, "w", False),
+                                           ("cant", "Cant", 58, "e", False), ("precio", "Precio", 90, "e", False),
+                                           ("desc", "Desc.", 90, "e", False), ("sub", "Subtotal", 100, "e", False)))
         fr.pack(fill="both", expand=True)
-        self.tree.tag_configure("hecho", background="#DCFCE7", foreground="#15803D")
+        self.tree.tag_configure("hecho", background=VERDE_BG, foreground=VERDE_T)
+        self.tree.tag_configure("promo_pend", background=AMB_BG, foreground=AMB_T)
+        self.tree.tag_configure("promo_ok", background=VERDE_BG, foreground=VERDE_T)
         self.tree.bind("<Delete>", lambda e: self.menos())
         self.tree.bind("<BackSpace>", lambda e: self.menos())
         self.vacio = tk.Label(self.tree, text="Escaneá un producto para empezar", bg=CARD, fg="#9CA3AF",
@@ -536,7 +1312,7 @@ class App(tk.Tk):
             Boton(qf, txt, lambda v=v: self.set_pago(v), color=SUAVE, hover=SUAVE_H, fg=SUAVE_T, h=38, size=9,
                   r=9).grid(row=0, column=i, sticky="ew", padx=2)
         tk.Checkbutton(t2.inner, text="Imprimir ticket al cobrar", variable=self.ticket, bg=CARD,
-                       activebackground=CARD, fg=TEXT, font=(FONT, 10), selectcolor="white",
+                       activebackground=CARD, fg=TEXT, activeforeground=TEXT, font=(FONT, 10), selectcolor=INPUT,
                        highlightthickness=0).pack(anchor="w", pady=(10, 0))
 
         self.cv = Tarjeta(right, width=410, pad=12)
@@ -567,12 +1343,11 @@ class App(tk.Tk):
         n = len(bajos())
         if "Stock" in self.tabs:
             self.tabs["Stock"].texto(f"Stock  ⚠ {n}" if n else "Stock", alerta=bool(n))
-
-    def aviso_stock(self):
-        b = bajos()
-        if b:
-            messagebox.showwarning("Poco stock", "Productos con poco stock:\n\n" +
-                                   "\n".join(f"• {n}: quedan {s:g}" for _, n, s, _ in b[:15]))
+        if "Reportes" in self.tabs:
+            m = len(sin_movimiento()) if self.rol == "admin" else 0
+            self.tabs["Reportes"].texto(f"Reportes  ⚠ {m}" if m else "Reportes", alerta=bool(m))
+        if "Sheets" in self.tabs:
+            self.tabs["Sheets"].texto("Sheets  ⚠" if self.sync["error"] else "Sheets", alerta=bool(self.sync["error"]))
 
     def set_pago(self, v):
         self.elegir("Efectivo")
@@ -592,8 +1367,11 @@ class App(tk.Tk):
         if "*" in txt:
             a, txt = txt.split("*", 1)
             cant = max(1, int(num(a)))
-        r = con.execute("SELECT nombre,precio,promo,valor,costo FROM productos WHERE codigo=?", (txt,)).fetchone()
+        r = con.execute("SELECT nombre,precio,promo,valor,costo,promo_n FROM productos WHERE codigo=?", (txt,)).fetchone()
         if not r:
+            if self.rol != "admin":
+                self.toast("Producto no cargado. Avisale al administrador", DANGER, 4500)
+                return
             # producto nuevo: te lleva a la pestaña Productos con el código ya cargado
             self.paginas["Productos"].nuevo_con_codigo(txt)
             self.ir("Productos")
@@ -603,45 +1381,61 @@ class App(tk.Tk):
         if txt in self.cart:
             self.cart[txt][2] += cant
         else:
-            self.cart[txt] = [r[0], r[1], cant, r[2], r[3], r[4]]
+            self.cart[txt] = [r[0], r[1], cant, r[2], r[3], r[4], r[5]]
         self.refresh()
         self.tree.selection_set(txt)
         self.tree.see(txt)
+        self.mostrar_promo(txt)
         self.scan.focus_set()
+
+    def mostrar_promo(self, cod):
+        """Cartel arriba: le avisa a quien cobra que el producto tiene promo, para que se la ofrezca al cliente."""
+        nom, pre, cant, promo, val, costo, n = self.cart[cod]
+        _, estado = info_promo(promo, val, n, cant)
+        et = etiqueta_promo(promo, val, n)
+        if estado == "pend":
+            self.lbl_promo.config(text=f"OFERTA en {nom}: {et}  →  ofrecele llevar más", bg=AMB_BG, fg=AMB_T)
+        elif estado == "ok":
+            self.lbl_promo.config(text=f"✓ Promo aplicada en {nom}: {et}", bg=VERDE_BG, fg=VERDE_T)
+        else:
+            self.lbl_promo.config(text=" ", bg=CARD, fg=MUTED)
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         self.total, ahorro = 0.0, 0.0
-        for i, (cod, (nom, pre, cant, promo, val, _)) in enumerate(self.cart.items()):
-            d = descuento(pre, cant, promo, val)
+        for i, (cod, (nom, pre, cant, promo, val, _, pn)) in enumerate(self.cart.items()):
+            d = descuento(pre, cant, promo, val, pn)
             sub = pre * cant - d
             self.total += sub
             ahorro += d
-            self.tree.insert("", "end", iid=cod, tags=("par",) if i % 2 else (),
-                             values=(nom, cant, fmt(pre), "-" + fmt(d) if d else "", fmt(sub)))
+            texto, estado = info_promo(promo, val, pn, cant)
+            tag = ("promo_" + estado,) if estado else (("par",) if i % 2 else ())
+            self.tree.insert("", "end", iid=cod, tags=tag,
+                             values=(nom, texto, cant, fmt(pre), "-" + fmt(d) if d else "", fmt(sub)))
         self.lbl_total.config(text=fmt(self.total))
         self.lbl_ahorro.config(text=f"Ahorro por promos: {fmt(ahorro)}" if ahorro else " ")
         if self.cart:
             self.vacio.place_forget()
         else:
             self.vacio.place(relx=0.5, rely=0.45, anchor="center")
+            self.lbl_promo.config(text=" ", bg=CARD, fg=MUTED)
         self.upd_vuelto()
 
     def upd_vuelto(self):
         txt = self.pago.get().strip()
         big, small = (FONT, 32, "bold"), (FONT, 22, "bold")
         if not self.cart and self.ultimo is not None:
-            face, fg, tit, val, f = "#DCFCE7", "#15803D", "VUELTO A ENTREGAR", fmt(self.ultimo), big
+            face, fg, tit, val, f = VERDE_BG, VERDE_T, "VUELTO A ENTREGAR", fmt(self.ultimo), big
         elif self.metodo.get() != "Efectivo":
-            face, fg, tit, val, f = "#F3F5F9", MUTED, "VUELTO", "No aplica", small
+            face, fg, tit, val, f = NEUTRO, MUTED, "VUELTO", "No aplica", small
         elif not txt or not self.cart:
-            face, fg, tit, val, f = "#F3F5F9", MUTED, "VUELTO", "—", big
+            face, fg, tit, val, f = NEUTRO, MUTED, "VUELTO", "—", big
         else:
             v = num(txt) - self.total
             if v >= 0:
-                face, fg, tit, val, f = "#DCFCE7", "#15803D", "VUELTO", fmt(v), big
+                face, fg, tit, val, f = VERDE_BG, VERDE_T, "VUELTO", fmt(v), big
             else:
-                face, fg, tit, val, f = "#FEE2E2", "#B91C1C", "FALTA", fmt(-v), big
+                face, fg, tit, val, f = ROJO_BG, ROJO_T, "FALTA", fmt(-v), big
         self.cv.pintar(face, self.vl_t, self.lbl_vuelto)
         self.vl_t.config(text=tit, fg=fg)
         self.lbl_vuelto.config(text=val, fg=fg, font=f)
@@ -695,12 +1489,13 @@ class App(tk.Tk):
         cur.execute("INSERT INTO ventas(fecha,total,metodo,pago,vuelto) VALUES(?,?,?,?,?)",
                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.total, metodo, pago, vuelto))
         vid = cur.lastrowid
-        for cod, (nom, pre, cant, promo, val, costo) in self.cart.items():
-            d = descuento(pre, cant, promo, val)
+        for cod, (nom, pre, cant, promo, val, costo, pn) in self.cart.items():
+            d = descuento(pre, cant, promo, val, pn)
             cur.execute("INSERT INTO items(venta_id,codigo,nombre,cantidad,precio,descuento,subtotal,costo) VALUES(?,?,?,?,?,?,?,?)",
                         (vid, cod, nom, cant, pre, d, pre * cant - d, costo))
             cur.execute("UPDATE productos SET stock=stock-? WHERE codigo=?", (cant, cod))  # descuenta stock
         con.commit()
+        self.pedir_sync()
         if self.ticket.get():
             imprimir(ticket_texto(vid), f"ticket_{vid}")
         poco = []
@@ -750,11 +1545,11 @@ def titulo(parent, texto):
     tk.Label(parent, text=texto, bg=CARD, fg=TEXT, font=(FONT, 14, "bold")).pack(anchor="w", pady=(0, 6))
 
 
-def campo(parent, texto, var, row, col, span=1, size=13):
+def campo(parent, texto, var, row, col, span=1, size=13, show=""):
     f = tk.Frame(parent, bg=CARD)
     f.grid(row=row, column=col, columnspan=span, sticky="ew", padx=4, pady=3)
     tk.Label(f, text=texto, bg=CARD, fg=MUTED, font=(FONT, 9, "bold")).pack(anchor="w")
-    e = entrada(f, size, textvariable=var)
+    e = entrada(f, size, textvariable=var, show=show)
     e.pack(fill="x", ipady=4)
     return e
 
@@ -768,7 +1563,7 @@ def gris(parent, texto, cmd, **kw):
 
 
 def rojo(parent, texto, cmd, **kw):
-    return Boton(parent, texto, cmd, color=DANGER_L, hover=DANGER_LH, fg="#B91C1C", **kw)
+    return Boton(parent, texto, cmd, color=DANGER_L, hover=DANGER_LH, fg=ROJO_T, **kw)
 
 
 # ---------- Pestaña Productos ----------
@@ -793,9 +1588,9 @@ class Productos(tk.Frame):
         entrada(top, 12, textvariable=self.pct, width=6).pack(side="right", padx=6, ipady=3)
         etiqueta(top, "Ajustar TODOS los precios en %").pack(side="right")
 
-        fr, self.t = lista(izq.inner, (("codigo", "Código", 130, "w", False), ("nombre", "Nombre", 250, "w", True),
-                                       ("precio", "Precio", 90, "e", False), ("costo", "Costo", 90, "e", False),
-                                       ("stock", "Stock", 70, "e", False), ("promo", "Promo", 180, "w", False)))
+        fr, self.t = lista(izq.inner, (("codigo", "Código", 110, "w", False), ("nombre", "Nombre", 190, "w", True),
+                                       ("precio", "Precio", 85, "e", False), ("costo", "Costo", 85, "e", False),
+                                       ("stock", "Stock", 60, "e", False), ("promo", "Promo", 200, "w", False)))
         fr.pack(fill="both", expand=True)
         self.t.bind("<<TreeviewSelect>>", self.sel)
 
@@ -803,7 +1598,7 @@ class Productos(tk.Frame):
         f = tk.Frame(der.inner, bg=CARD)
         f.pack(fill="x")
         f.columnconfigure((0, 1), weight=1, uniform="c")
-        self.v = {k: tk.StringVar() for k in ("codigo", "nombre", "precio", "costo", "stock", "stock_min", "valor")}
+        self.v = {k: tk.StringVar() for k in ("codigo", "nombre", "precio", "costo", "stock", "stock_min", "valor", "promo_n")}
         self.promo = tk.StringVar(value=PROMOS["ninguna"])
         self.e_codigo = campo(f, "Código de barras", self.v["codigo"], 0, 0, 2)
         self.e_nombre = campo(f, "Nombre", self.v["nombre"], 1, 0, 2)
@@ -812,11 +1607,17 @@ class Productos(tk.Frame):
         campo(f, "Stock actual", self.v["stock"], 3, 0)
         campo(f, "Stock mínimo (aviso)", self.v["stock_min"], 3, 1)
         pf = tk.Frame(f, bg=CARD)
-        pf.grid(row=4, column=0, sticky="ew", padx=4, pady=3)
+        pf.grid(row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=3)
         etiqueta(pf, "Promo").pack(anchor="w")
         ttk.Combobox(pf, textvariable=self.promo, values=list(PROMOS.values()), state="readonly",
                      font=(FONT, 11)).pack(fill="x", ipady=3)
-        campo(f, "% (si es Descuento %)", self.v["valor"], 4, 1)
+        campo(f, "% de descuento", self.v["valor"], 5, 0)
+        campo(f, "N (unidad o cantidad)", self.v["promo_n"], 5, 1)
+        self.lbl_ayuda = tk.Label(f, text="", bg=CARD, fg=MUTED, font=(FONT, 9), wraplength=390, justify="left",
+                                  anchor="w")
+        self.lbl_ayuda.grid(row=6, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 2))
+        self.promo.trace_add("write", lambda *a: self.ayuda_promo())
+        self.v["promo_n"].set("2")
         tk.Label(der.inner, text="Decimales con coma: 1500,50", bg=CARD, fg=MUTED, font=(FONT, 9)).pack(anchor="w", pady=(4, 0))
         b = tk.Frame(der.inner, bg=CARD)
         b.pack(fill="x", pady=(10, 0))
@@ -832,31 +1633,35 @@ class Productos(tk.Frame):
     def load(self):
         self.t.delete(*self.t.get_children())
         q = f"%{self.q.get()}%"
-        for i, (cod, nom, pre, costo, stock, promo, val) in enumerate(con.execute(
-                "SELECT codigo,nombre,precio,costo,stock,promo,valor FROM productos "
+        for i, (cod, nom, pre, costo, stock, promo, val, pn) in enumerate(con.execute(
+                "SELECT codigo,nombre,precio,costo,stock,promo,valor,promo_n FROM productos "
                 "WHERE codigo LIKE ? OR nombre LIKE ? ORDER BY nombre", (q, q))):
-            p = PROMOS.get(promo, "") + (f" {val:g}%" if promo == "pct" else "")
             self.t.insert("", "end", iid=cod, tags=("par",) if i % 2 else (),
                           values=(cod, nom, fmt(pre), fmt(costo) if costo else "-", f"{stock:g}",
-                                  "" if promo == "ninguna" else p))
+                                  etiqueta_promo(promo, val, pn)))
 
     def sel(self, _=None):
         s = self.t.selection()
         if not s:
             return
-        cod, nom, pre, costo, stock, smin, promo, val = con.execute(
-            "SELECT codigo,nombre,precio,costo,stock,stock_min,promo,valor FROM productos WHERE codigo=?", (s[0],)).fetchone()
+        cod, nom, pre, costo, stock, smin, promo, val, pn = con.execute(
+            "SELECT codigo,nombre,precio,costo,stock,stock_min,promo,valor,promo_n FROM productos WHERE codigo=?",
+            (s[0],)).fetchone()
         for k, x in (("codigo", cod), ("nombre", nom), ("precio", f"{pre:g}".replace(".", ",")),
                      ("costo", f"{costo:g}".replace(".", ",")), ("stock", f"{stock:g}"),
-                     ("stock_min", f"{smin:g}"), ("valor", f"{val:g}")):
+                     ("stock_min", f"{smin:g}"), ("valor", f"{val:g}"), ("promo_n", f"{pn or 2}")):
             self.v[k].set(x)
         self.promo.set(PROMOS.get(promo, PROMOS["ninguna"]))
 
     def nuevo(self):
         for v in self.v.values():
             v.set("")
+        self.v["promo_n"].set("2")
         self.promo.set(PROMOS["ninguna"])
         self.volver = False
+
+    def ayuda_promo(self):
+        self.lbl_ayuda.config(text=AYUDA_PROMO.get(REV.get(self.promo.get(), "ninguna"), ""))
 
     def nuevo_con_codigo(self, cod):
         """Viene de escanear un código que no existe: lo deja cargado para completar."""
@@ -870,13 +1675,28 @@ class Productos(tk.Frame):
         if not cod or not nom or pre <= 0:
             self.app.toast("Completá código, nombre y precio de venta", DANGER)
             return
-        con.execute("""INSERT INTO productos(codigo,nombre,precio,costo,stock,stock_min,promo,valor) VALUES(?,?,?,?,?,?,?,?)
+        promo, val, pn = REV[self.promo.get()], num(self.v["valor"].get()), int(num(self.v["promo_n"].get()) or 2)
+        if promo in ("pct", "nesima", "pack") and not (0 < val <= 100):
+            self.app.toast("Poné el % de descuento (entre 1 y 100)", DANGER)
+            return
+        if promo in ("nesima", "pack") and pn < 2:
+            self.app.toast("N tiene que ser 2 o más", DANGER)
+            return
+        viejo = con.execute("SELECT stock FROM productos WHERE codigo=?", (cod,)).fetchone()
+        con.execute("""INSERT INTO productos(codigo,nombre,precio,costo,stock,stock_min,promo,valor,promo_n,creado)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(codigo) DO UPDATE SET nombre=excluded.nombre, precio=excluded.precio,
                        costo=excluded.costo, stock=excluded.stock, stock_min=excluded.stock_min,
-                       promo=excluded.promo, valor=excluded.valor""",
+                       promo=excluded.promo, valor=excluded.valor, promo_n=excluded.promo_n""",
                     (cod, nom, pre, num(self.v["costo"].get()), num(self.v["stock"].get()),
-                     num(self.v["stock_min"].get()), REV[self.promo.get()], num(self.v["valor"].get())))
+                     num(self.v["stock_min"].get()), promo, val, pn, datetime.now().strftime("%Y-%m-%d")))
+        con.execute("DELETE FROM cola_borrados WHERE codigo=? AND subida=0", (cod,))
         con.commit()
+        registrar_ingreso(cod, num(self.v["stock"].get()) - (viejo[0] if viejo else 0),
+                          "Ajuste desde Productos" if viejo else "Alta de producto")
+        con.execute("UPDATE productos SET sucio=1 WHERE codigo=?", (cod,))
+        con.commit()
+        self.app.pedir_sync()
         volvio = self.volver
         self.load()
         self.nuevo()
@@ -891,10 +1711,12 @@ class Productos(tk.Frame):
         cod = self.v["codigo"].get().strip()
         if cod and messagebox.askyesno("Eliminar", f"¿Eliminar el producto {cod} de la base?"):
             con.execute("DELETE FROM productos WHERE codigo=?", (cod,))
+            con.execute("INSERT INTO cola_borrados(codigo) VALUES(?)", (cod,))   # también se borra de la planilla
             con.commit()
             self.load()
             self.nuevo()
             self.app.upd_stock_btn()
+            self.app.pedir_sync()
             self.app.toast("Producto eliminado", HEAD)
 
     def masivo(self):
@@ -905,10 +1727,11 @@ class Productos(tk.Frame):
         p = num(txt)
         if not messagebox.askyesno("Cambio masivo", f"¿Cambiar TODOS los precios {p:+g}%?"):
             return
-        con.execute("UPDATE productos SET precio=ROUND(precio*(1+?/100.0))", (p,))
+        con.execute("UPDATE productos SET precio=ROUND(precio*(1+?/100.0)), sucio=1", (p,))
         con.commit()
         self.pct.set("")
         self.load()
+        self.app.pedir_sync()
         self.app.toast(f"Precios actualizados {p:+g}%", OK)
 
 
@@ -932,12 +1755,13 @@ class Stock(tk.Frame):
         self.q.trace_add("write", lambda *a: self.load())
         self.solo = tk.BooleanVar()
         tk.Checkbutton(top, text="Solo poco stock", variable=self.solo, command=self.load, bg=CARD,
-                       activebackground=CARD, font=(FONT, 10), highlightthickness=0).pack(side="left", padx=10)
+                       activebackground=CARD, fg=TEXT, activeforeground=TEXT, selectcolor=INPUT, font=(FONT, 10),
+                       highlightthickness=0).pack(side="left", padx=10)
         fr, self.t = lista(izq.inner, (("codigo", "Código", 130, "w", False), ("nombre", "Nombre", 260, "w", True),
                                        ("stock", "Stock", 80, "e", False), ("minimo", "Mínimo", 80, "e", False),
                                        ("estado", "Estado", 110, "w", False)))
         fr.pack(fill="both", expand=True)
-        self.t.tag_configure("bajo", background="#FFE0E0")
+        self.t.tag_configure("bajo", background=ROJO_BG)
         self.t.bind("<<TreeviewSelect>>", self.sel)
 
         titulo(der.inner, "Reponer mercadería")
@@ -1002,11 +1826,15 @@ class Stock(tk.Frame):
         n = num(self.c.get())
         if tipo == "sumar":
             con.execute("UPDATE productos SET stock=stock+? WHERE codigo=?", (n, s[0]))
+            registrar_ingreso(s[0], n, "Ingreso de mercadería")
         elif tipo == "fijar":
+            actual = con.execute("SELECT stock FROM productos WHERE codigo=?", (s[0],)).fetchone()[0]
             con.execute("UPDATE productos SET stock=? WHERE codigo=?", (n, s[0]))
+            registrar_ingreso(s[0], n - actual, "Inventario (stock contado)")
         else:
-            con.execute("UPDATE productos SET stock_min=? WHERE codigo=?", (n, s[0]))
+            con.execute("UPDATE productos SET stock_min=?, sucio=1 WHERE codigo=?", (n, s[0]))
         con.commit()
+        self.app.pedir_sync()
         self.c.set("")
         self.load()
         self.sel()
@@ -1117,6 +1945,9 @@ class Ventas(tk.Frame):
             self.app.toast("Ticket enviado a la impresora", HEAD)
 
     def anular(self):
+        if self.app.rol != "admin":
+            self.app.toast("Solo el administrador puede anular ventas", AMBAR)
+            return
         vid = self.sel_id
         if not vid:
             self.app.toast("Elegí una venta primero", DANGER)
@@ -1132,6 +1963,7 @@ class Ventas(tk.Frame):
         con.commit()
         self.load(vid)
         self.app.upd_stock_btn()
+        self.app.pedir_sync()
         self.app.toast(f"Venta {vid} anulada", HEAD)
 
 
@@ -1200,6 +2032,14 @@ class Reportes(tk.Frame):
         L += [f"{i}. {nom[:24]:<24} {int(c):>4} u.  {fmt(t):>9}" for i, (nom, c, t, g) in enumerate(top, 1)] or ["(sin ventas)"]
         L += ["", "QUE MAS GANANCIA DEJA", "-" * 46]
         L += [f"{i}. {nom[:24]:<24} {fmt(g):>12}" for i, (nom, c, t, g) in enumerate(topg, 1)] or ["(sin ventas)"]
+        sm = sin_movimiento()
+        L += ["", f"SIN VENTAS HACE {cfg('dias_sin_venta')}+ DIAS ({len(sm)})", "-" * 46]
+        for cod, nom, st, d, ult in sm[:30]:
+            L.append(f"{nom[:24]:<24} stock {st:g}".ljust(36) + (f"hace {d} dias" if ult else f"sin ventas (cargado hace {d} dias)"))
+        if len(sm) > 30:
+            L.append(f"... y {len(sm) - 30} mas")
+        if not sm:
+            L.append("(todo se esta moviendo bien)")
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", "\n".join(L))
@@ -1266,7 +2106,9 @@ class Cierre(tk.Frame):
             dif = num(self.cont.get()) - esp
             L += [linea("Efectivo contado", fmt(num(self.cont.get()))),
                   linea("SOBRA" if dif >= 0 else "FALTA", fmt(abs(dif)))]
-        L += ["-" * a, linea("Ganancia estimada", fmt(self.gan))]
+        L += ["-" * a]
+        if self.app.rol == "admin":
+            L += [linea("Ganancia estimada", fmt(self.gan))]
         return "\n".join(L)
 
     def mostrar(self):
@@ -1288,8 +2130,154 @@ class Cierre(tk.Frame):
         self.app.toast("Caja cerrada ✓", OK)
 
 
+# ---------- Pestaña Sheets (conexión con Google Sheets) ----------
+class Sheets(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        wrap = envoltorio(self)
+        izq = Tarjeta(wrap, width=470)
+        izq.pack(side="left", anchor="n")
+        der = Tarjeta(wrap, auto=False)
+        der.pack(side="right", fill="both", expand=True, padx=(16, 0))
+
+        titulo(izq.inner, "Conexión con Google Sheets")
+        self.lbl_estado = tk.Label(izq.inner, text="", bg=CARD, font=(FONT, 11, "bold"), anchor="w", justify="left",
+                                   wraplength=430)
+        self.lbl_estado.pack(fill="x", pady=(0, 6))
+        f = tk.Frame(izq.inner, bg=CARD)
+        f.pack(fill="x")
+        f.columnconfigure((0, 1), weight=1, uniform="c")
+        self.v_id = tk.StringVar(value=cfg("sheets_id"))
+        self.v_caja = tk.StringVar(value=cfg("caja_id"))
+        self.v_seg = tk.StringVar(value=cfg("sheets_seg"))
+        campo(f, "Link o ID de la planilla", self.v_id, 0, 0, 2, size=11)
+        campo(f, "Nombre de esta caja (ej: C1)", self.v_caja, 1, 0, size=11)
+        campo(f, "Sincronizar cada (segundos)", self.v_seg, 1, 1, size=11)
+        self.lbl_json = tk.Label(izq.inner, text="", bg=CARD, fg=MUTED, font=(FONT, 10), anchor="w", justify="left",
+                                 wraplength=430)
+        self.lbl_json.pack(fill="x", pady=(8, 0))
+        gris(izq.inner, "Elegir archivo de claves (.json)", self.elegir_json, h=42, size=10).pack(fill="x", pady=(6, 0))
+        self.on = tk.BooleanVar(value=cfg("sheets_on") == "1")
+        tk.Checkbutton(izq.inner, text="Sincronizar automáticamente", variable=self.on, command=self.guardar_campos,
+                       bg=CARD, activebackground=CARD, fg=TEXT, activeforeground=TEXT, selectcolor=INPUT,
+                       font=(FONT, 10), highlightthickness=0).pack(anchor="w", pady=(10, 4))
+        Boton(izq.inner, "1) Guardar y probar conexión", self.probar, h=46, size=11).pack(fill="x", pady=(4, 0))
+        Boton(izq.inner, "2) Preparar planilla (primera vez)", self.preparar, color=SUAVE, hover=SUAVE_H, fg=SUAVE_T,
+              h=46, size=11).pack(fill="x", pady=(8, 0))
+        Boton(izq.inner, "Reparar planilla (fórmulas y formato)", self.reparar, color=GRIS, hover=GRIS_H, fg=TEXT,
+              h=42, size=10).pack(fill="x", pady=(8, 0))
+        Boton(izq.inner, "Sincronizar ahora", self.ahora, color=OK, hover=OK_H, h=46, size=11).pack(fill="x", pady=(8, 0))
+
+        titulo(der.inner, "Estado")
+        self.lbl_pend = tk.Label(der.inner, text="", bg=CARD, fg=TEXT, font=(FONT, 11), anchor="w", justify="left")
+        self.lbl_pend.pack(fill="x")
+        tk.Label(der.inner, text=("Cómo se usa la planilla:\n"
+                                  "• Hoja Productos: precios, costos, promos y stock mínimo. Editá ahí o en el programa.\n"
+                                  "• Si borrás una fila de Productos, el producto se borra también del programa (y al revés).\n"
+                                  "• Hoja Ingresos: para cargar mercadería, agregá una fila (Código y Cantidad).\n"
+                                  "• Stock actual (columna H): es una fórmula. No la toques. Si no anda, tocá Reparar planilla.\n"
+                                  "• Hoja Movimientos: cada venta se agrega sola."),
+                 bg=CARD, fg=MUTED, font=(FONT, 10), anchor="w", justify="left", wraplength=520).pack(fill="x", pady=(10, 8))
+        etiqueta(der.inner, "Últimos eventos").pack(anchor="w")
+        self.log = tk.Text(der.inner, font=("Consolas", 10), wrap="word", bg=INPUT, fg=TEXT, relief="flat",
+                           highlightthickness=0, height=8, padx=8, pady=6)
+        self.log.pack(fill="both", expand=True, pady=(4, 0))
+        self.al_mostrar()
+
+    def al_mostrar(self):
+        self.on.set(cfg("sheets_on") == "1")
+        mail = mail_del_json()
+        self.lbl_json.config(text=(f"Archivo de claves: OK\nCompartí la planilla (como Editor) con: {mail}" if mail else
+                                   "Falta el archivo de claves. Tocá el botón de abajo y elegí el .json que descargaste "
+                                   "de Google Cloud."))
+        s = self.app.sync
+        if s["corriendo"]:
+            t, c = "● Sincronizando...", PRIMARY
+        elif s["error"]:
+            t, c = "● " + s["error"], DANGER
+        elif cfg("sheets_preparada") != "1":
+            t, c = "● Falta preparar la planilla (paso 2).", AMBAR
+        elif cfg("sheets_on") != "1":
+            t, c = "● Sincronización apagada.", MUTED
+        elif s["ultimo"]:
+            t, c = f"● Conectado. Última sincronización: {s['ultimo']}", OK
+        else:
+            t, c = "● Conectado. Esperando la primera sincronización...", MUTED
+        self.lbl_estado.config(text=t, fg=c)
+        v = con.execute("SELECT COUNT(*) FROM ventas WHERE subida=0 AND anulada=0").fetchone()[0]
+        i = con.execute("SELECT COUNT(*) FROM cola_ingresos WHERE subida=0").fetchone()[0]
+        p = con.execute("SELECT COUNT(*) FROM productos WHERE sucio=1").fetchone()[0]
+        self.lbl_pend.config(text=f"Pendiente de subir:  {v} venta(s)   ·   {i} ingreso(s) de stock   ·   {p} producto(s)")
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.insert("1.0", "\n".join(self.app.sync_log[-30:][::-1]) or "(todavía no pasó nada)")
+        self.log.config(state="disabled")
+
+    def guardar_campos(self):
+        set_cfg("sheets_id", extraer_id(self.v_id.get()))
+        set_cfg("caja_id", self.v_caja.get().strip() or "C1")
+        m = self.v_seg.get().strip()
+        set_cfg("sheets_seg", m if m.isdigit() and int(m) >= 15 else "60")
+        set_cfg("sheets_on", "1" if self.on.get() else "0")
+
+    def elegir_json(self):
+        ruta = filedialog.askopenfilename(title="Archivo de claves de Google", filetypes=[("JSON", "*.json")])
+        if not ruta:
+            return
+        try:
+            with open(ruta, encoding="utf-8") as f:
+                d = json.load(f)
+            if "client_email" not in d or "private_key" not in d:
+                raise ValueError
+        except (OSError, ValueError):
+            self.app.toast("Ese archivo no parece ser una clave de cuenta de servicio", DANGER, 5000)
+            return
+        shutil.copy(ruta, RUTA_JSON)
+        self.al_mostrar()
+        self.app.toast("Archivo de claves guardado ✓", OK)
+
+    def probar(self):
+        self.guardar_campos()
+        if not cfg("sheets_id"):
+            self.app.toast("Pegá el link de la planilla", DANGER)
+            return
+        self.app.lanzar_sync("probar", manual=True)
+        self.al_mostrar()
+
+    def reparar(self):
+        self.guardar_campos()
+        if not cfg("sheets_id"):
+            self.app.toast("Pegá el link de la planilla", DANGER)
+            return
+        self.app.lanzar_sync("reparar", manual=True)
+        self.al_mostrar()
+
+    def preparar(self):
+        self.guardar_campos()
+        if not cfg("sheets_id"):
+            self.app.toast("Pegá el link de la planilla", DANGER)
+            return
+        if cfg("sheets_preparada") == "1":
+            self.app.toast("La planilla ya está preparada. Si algo no anda, usá Reparar planilla", AMBAR, 5000)
+            return
+        if messagebox.askyesno("Preparar planilla",
+                               "Se van a crear las hojas Productos, Ingresos y Movimientos (si no existen) y se "
+                               "subirán tus productos con su stock actual.\n\n¿Continuar?"):
+            self.app.lanzar_sync("preparar", manual=True)
+            self.al_mostrar()
+
+    def ahora(self):
+        self.guardar_campos()
+        if cfg("sheets_preparada") != "1":
+            self.app.toast("Primero hacé los pasos 1 y 2", AMBAR)
+            return
+        self.app.lanzar_sync("sync", manual=True)
+        self.al_mostrar()
+
+
 # ---------- Pestaña Configuración ----------
-CFG_CAMPOS = ("nombre", "t_nombre", "t_l2", "t_l3", "t_num", "t_total", "t_pie", "t_pie2")
+CFG_CAMPOS = ("nombre", "t_nombre", "t_l2", "t_l3", "t_num", "t_total", "t_pie", "t_pie2", "dias_sin_venta")
 ANCHOS = ("80 mm (40 caracteres)", "58 mm (32 caracteres)")
 
 
@@ -1306,25 +2294,27 @@ class Configuracion(tk.Frame):
         C.pack(side="left", fill="both", expand=True)
         self.v = {k: tk.StringVar(value=cfg(k)) for k in CFG_CAMPOS}
 
-        a1 = Tarjeta(A, width=320)
+        a1 = Tarjeta(A, width=330)
         a1.pack(fill="x")
         titulo(a1.inner, "Tu kiosco")
         f = tk.Frame(a1.inner, bg=CARD)
         f.pack(fill="x")
         f.columnconfigure(0, weight=1)
         campo(f, "Nombre del kiosco", self.v["nombre"], 0, 0)
+        campo(f, "Aviso: sin ventas hace (días)", self.v["dias_sin_venta"], 1, 0)
 
-        a2 = Tarjeta(A, width=320)
+        a2 = Tarjeta(A, width=330)
         a2.pack(fill="x", pady=(14, 0))
-        titulo(a2.inner, "Impresión")
-        etiqueta(a2.inner, "Ancho del papel de la impresora").pack(anchor="w")
-        self.ancho = tk.StringVar(value=ANCHOS[1] if ancho() == 32 else ANCHOS[0])
-        ttk.Combobox(a2.inner, textvariable=self.ancho, values=ANCHOS, state="readonly",
-                     font=(FONT, 11)).pack(fill="x", ipady=3, pady=(4, 10))
-        self.auto = tk.BooleanVar(value=cfg("auto_ticket") == "1")
-        tk.Checkbutton(a2.inner, text="Imprimir ticket automáticamente al cobrar", variable=self.auto, bg=CARD,
-                       activebackground=CARD, font=(FONT, 10), selectcolor="white", highlightthickness=0,
-                       wraplength=280, justify="left").pack(anchor="w")
+        titulo(a2.inner, "Seguridad (PIN)")
+        self.lbl_pin = tk.Label(a2.inner, text="", bg=CARD, fg=MUTED, font=(FONT, 10), wraplength=290, justify="left")
+        self.lbl_pin.pack(anchor="w")
+        f3 = tk.Frame(a2.inner, bg=CARD)
+        f3.pack(fill="x")
+        f3.columnconfigure(0, weight=1)
+        self.pin_a, self.pin_e = tk.StringVar(), tk.StringVar()
+        campo(f3, "PIN administrador (4 a 8 números)", self.pin_a, 0, 0, show="•")
+        campo(f3, "PIN empleado (4 a 8 números)", self.pin_e, 1, 0, show="•")
+        rojo(a2.inner, "Quitar protección con PIN", self.quitar_pins, h=40, size=10).pack(fill="x", pady=(8, 0))
         Boton(A, "Guardar cambios", self.guardar, color=OK, hover=OK_H, h=56, size=14, bgc=BG).pack(fill="x", pady=(14, 0))
 
         b1 = Tarjeta(B, width=380)
@@ -1341,8 +2331,17 @@ class Configuracion(tk.Frame):
         campo(f2, "Mensaje final", self.v["t_pie"], 4, 0, 2)
         campo(f2, "Mensaje final 2 (opcional)", self.v["t_pie2"], 5, 0, 2)
 
-        titulo(C.inner, "Vista previa del ticket")
-        self.prev = tk.Label(C.inner, font=("Consolas", 10), justify="left", anchor="nw", bg="white", fg=TEXT,
+        titulo(C.inner, "Impresión")
+        etiqueta(C.inner, "Ancho del papel de la impresora").pack(anchor="w")
+        self.ancho = tk.StringVar(value=ANCHOS[1] if ancho() == 32 else ANCHOS[0])
+        ttk.Combobox(C.inner, textvariable=self.ancho, values=ANCHOS, state="readonly",
+                     font=(FONT, 11)).pack(fill="x", ipady=3, pady=(4, 8))
+        self.auto = tk.BooleanVar(value=cfg("auto_ticket") == "1")
+        tk.Checkbutton(C.inner, text="Imprimir ticket automáticamente al cobrar", variable=self.auto, bg=CARD,
+                       activebackground=CARD, fg=TEXT, activeforeground=TEXT, font=(FONT, 10), selectcolor=INPUT,
+                       highlightthickness=0).pack(anchor="w", pady=(0, 10))
+        etiqueta(C.inner, "Vista previa del ticket").pack(anchor="w", pady=(0, 4))
+        self.prev = tk.Label(C.inner, font=("Consolas", 10), justify="left", anchor="nw", bg="white", fg="#111827",
                              relief="solid", bd=1, padx=12, pady=12)
         self.prev.pack(anchor="nw")
         gris(C.inner, "Imprimir ticket de prueba", self.prueba, h=44, size=10).pack(anchor="nw", pady=(12, 0), fill="x")
@@ -1350,6 +2349,16 @@ class Configuracion(tk.Frame):
             v.trace_add("write", lambda *a: self.preview())
         self.ancho.trace_add("write", lambda *a: self.preview())
         self.preview()
+        self.estado_pin()
+
+    def estado_pin(self):
+        if cfg("pin_admin"):
+            t = ("Protección ACTIVA: se pide PIN al abrir y al tocar Bloquear. "
+                 + ("El empleado solo ve Caja, Stock, Ventas y Cierre." if cfg("pin_empleado")
+                    else "Todavía no hay PIN de empleado."))
+        else:
+            t = "Sin PIN: cualquiera que abra el programa entra como administrador."
+        self.lbl_pin.config(text=t)
 
     def conf(self):
         d = {k: v.get() for k, v in self.v.items()}
@@ -1367,13 +2376,59 @@ class Configuracion(tk.Frame):
         imprimir(self.texto_prueba(), "prueba")
         self.app.toast("Ticket de prueba enviado", HEAD)
 
+    def guardar_pins(self):
+        a, e = self.pin_a.get().strip(), self.pin_e.get().strip()
+        if not a and not e:
+            return True
+        for p in (a, e):
+            if p and not (p.isdigit() and 4 <= len(p) <= 8):
+                self.app.toast("El PIN debe tener entre 4 y 8 números", DANGER)
+                return False
+        adm = hpin(a) if a else cfg("pin_admin")
+        emp = hpin(e) if e else cfg("pin_empleado")
+        if not adm:
+            self.app.toast("Primero definí el PIN del administrador", DANGER)
+            return False
+        if emp and emp == adm:
+            self.app.toast("El PIN del empleado tiene que ser distinto al del administrador", DANGER)
+            return False
+        if a:
+            set_cfg("pin_admin", adm)
+            codigo = secrets.token_hex(3).upper()
+            set_cfg("pin_rec", hpin(codigo))
+            messagebox.showinfo("Código de recuperación",
+                                f"Tu código de recuperación es:\n\n{codigo}\n\nAnotalo y guardalo en un lugar seguro. "
+                                "Si te olvidás el PIN del administrador es la única forma de volver a entrar.")
+        if e:
+            set_cfg("pin_empleado", emp)
+        self.pin_a.set("")
+        self.pin_e.set("")
+        return True
+
+    def quitar_pins(self):
+        if not cfg("pin_admin"):
+            self.app.toast("No hay PIN configurado", HEAD)
+            return
+        if messagebox.askyesno("Quitar PIN", "¿Quitar la protección con PIN? Cualquiera podrá entrar como administrador."):
+            for k in ("pin_admin", "pin_empleado", "pin_rec"):
+                set_cfg(k, "")
+            self.estado_pin()
+            self.app.aplicar_rol()
+            self.app.toast("Protección con PIN desactivada", HEAD)
+
     def guardar(self):
+        if not self.guardar_pins():
+            return
         for k, v in self.conf().items():
             set_cfg(k, v.strip() if k != "ancho" else v)
+        if not cfg("dias_sin_venta").isdigit():
+            set_cfg("dias_sin_venta", "21")
+            self.v["dias_sin_venta"].set("21")
         set_cfg("auto_ticket", "1" if self.auto.get() else "0")
         self.app.lbl_nombre.config(text=nombre())
-        self.app.title(nombre() + " - Caja")
         self.app.ticket.set(self.auto.get())
+        self.app.aplicar_rol()
+        self.estado_pin()
         self.app.toast("Configuración guardada ✓", OK)
 
 
